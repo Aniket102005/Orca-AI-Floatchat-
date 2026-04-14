@@ -1,0 +1,78 @@
+import os
+import pandas as pd
+import numpy as np
+import logging
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from sqlalchemy import create_engine, text
+from backend.llm.rag_handler import handle_question
+from pydantic import BaseModel
+from typing import List, Optional
+
+# Configure logging for structured output
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+app = FastAPI()
+
+# Define request model for chat
+class ChatRequest(BaseModel):
+    question: str
+    chat_history: Optional[List[dict]] = []
+
+# --- Database Connection ---
+try:
+    db_url = (
+        f"postgresql+psycopg2://{os.getenv('POSTGRES_USER')}:"
+        f"{os.getenv('POSTGRES_PASSWORD')}@{os.getenv('POSTGRES_HOST')}:"
+        f"{os.getenv('POSTGRES_PORT')}/{os.getenv('POSTGRES_DB')}?client_encoding=utf8"
+    )
+    engine = create_engine(db_url)
+    logging.info("Successfully connected to PostgreSQL for API.")
+except Exception as e:
+    logging.error(f"Failed to connect to PostgreSQL for API: {e}", exc_info=True)
+    engine = None
+
+@app.post('/api/chat')
+async def chat_handler(request: ChatRequest):
+    question = request.question
+    chat_history = request.chat_history
+
+    # Get the unified response from the new AI handler
+    ai_response = handle_question(question, chat_history)
+    response_type = ai_response.get('response_type')
+
+    # If the AI decided it's a database query, execute it
+    if response_type == 'database':
+        sql_query = ai_response.get('sql_query')
+        viz_type = ai_response.get('visualization_type', 'table')
+        try:
+            logging.debug(f"Executing SQL query: {sql_query}")
+            with engine.connect() as connection:
+              df = pd.read_sql(text(sql_query), connection)
+
+# Fix timestamp serialization
+            for col in df.select_dtypes(include=['datetime64[ns]', 'datetimetz']):
+             df[col] = df[col].astype(str)
+
+            df = df.replace({np.nan: None})
+            result = df.to_dict(orient='records')
+
+            logging.info(f"Query successful. Found {len(result)} records.")
+
+            return JSONResponse({
+                "data": result,
+                "sql_query": sql_query,
+                "visualization": viz_type
+            })
+        except Exception as e:
+            logging.error(f"Error executing SQL query: {sql_query}", exc_info=True)
+            return JSONResponse({ "error": "Failed to execute SQL query.", "details": str(e) }, status_code=500)
+    
+    # If it's a text response, just forward the answer
+    elif response_type == 'text':
+        return JSONResponse({ "data": ai_response.get('answer'), "visualization": "text" })
+    
+    # Fallback for any unexpected response types
+    else:
+        logging.warning(f"Received unexpected response type from AI: {response_type}")
+        return JSONResponse({ "data": "Sorry, I received an unexpected response format.", "visualization": "text" })
